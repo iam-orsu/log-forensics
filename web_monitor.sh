@@ -63,29 +63,62 @@ function get_ts() {
     return ts
 }
 
+function extract_ip(field) {
+    # Input: "203.0.113.45.54321" -> Output: "203.0.113.45"
+    n = split(field, parts, ".")
+    if (n >= 5) {
+        return parts[1] "." parts[2] "." parts[3] "." parts[4]
+    }
+    return ""
+}
+
+function extract_port(field) {
+    # Input: "10.0.0.1.80:" -> Output: "80"
+    gsub(/:$/, "", field)
+    n = split(field, parts, ".")
+    if (n >= 5) {
+        return parts[5]
+    }
+    return ""
+}
+
 # Capture packet header line with IPs
-/^[0-9]{4}-[0-9]{2}-[0-9]{2}/ {
-    # Extract visitor IP (source)
-    if (match($3, /([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)\./, arr)) {
-        visitor_ip = arr[1]
-    } else {
-        visitor_ip = ""
+# Format: 2026-02-06 15:56:45.123456 IP 203.0.113.45.54321 > 10.0.0.1.80: Flags [S]
+/^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}/ {
+    visitor_ip = ""
+    port = ""
+    
+    # Find "IP" keyword and extract source (visitor) IP
+    for (i = 1; i <= NF; i++) {
+        if ($i == "IP" && $(i+1) != "") {
+            visitor_ip = extract_ip($(i+1))
+            break
+        }
+        if ($i == "IP6" && $(i+1) != "") {
+            # IPv6 - just grab the address part
+            visitor_ip = $(i+1)
+            gsub(/\.[0-9]+$/, "", visitor_ip)
+            break
+        }
     }
     
-    # Extract destination port
-    if (match($5, /\.([0-9]+):/, arr)) {
-        port = arr[1]
-    } else {
-        port = ""
+    # Find destination port (after ">")
+    for (i = 1; i <= NF; i++) {
+        if ($i == ">" && $(i+1) != "") {
+            port = extract_port($(i+1))
+            break
+        }
     }
     
-    # Detect new connection (SYN)
-    if ($0 ~ /Flags \[S\]/) {
-        ts = get_ts()
-        proto = (port == "443") ? "HTTPS" : "HTTP"
-        json = sprintf("{\"ts\":\"%s\",\"event\":\"NEW_CONN\",\"visitor\":\"%s\",\"port\":%s,\"proto\":\"%s\"}", 
-                       ts, visitor_ip, port, proto)
-        emit(json)
+    # Detect new connection (SYN flag)
+    if ($0 ~ /Flags \[S\]/ || $0 ~ /Flags \[S\.\]/) {
+        if (visitor_ip != "") {
+            ts = get_ts()
+            proto = (port == "443") ? "HTTPS" : "HTTP"
+            json = sprintf("{\"ts\":\"%s\",\"event\":\"NEW_VISITOR\",\"ip\":\"%s\",\"port\":%s,\"proto\":\"%s\"}", 
+                           ts, visitor_ip, (port != "" ? port : "0"), proto)
+            emit(json)
+        }
     }
     next
 }
@@ -98,7 +131,7 @@ function get_ts() {
     uri = $2
     ts = get_ts()
     
-    json = sprintf("{\"ts\":\"%s\",\"event\":\"REQUEST\",\"visitor\":\"%s\",\"method\":\"%s\",\"path\":\"%s\"}", 
+    json = sprintf("{\"ts\":\"%s\",\"event\":\"REQUEST\",\"ip\":\"%s\",\"method\":\"%s\",\"path\":\"%s\"}", 
                    ts, visitor_ip, method, json_escape(uri))
     emit(json)
     next
@@ -112,7 +145,7 @@ function get_ts() {
     gsub(/\r/, "", host)
     ts = get_ts()
     
-    json = sprintf("{\"ts\":\"%s\",\"event\":\"HOST\",\"visitor\":\"%s\",\"host\":\"%s\"}", 
+    json = sprintf("{\"ts\":\"%s\",\"event\":\"HOST\",\"ip\":\"%s\",\"host\":\"%s\"}", 
                    ts, visitor_ip, json_escape(host))
     emit(json)
     next
@@ -126,7 +159,7 @@ function get_ts() {
     gsub(/\r/, "", ua)
     ts = get_ts()
     
-    json = sprintf("{\"ts\":\"%s\",\"event\":\"USER_AGENT\",\"visitor\":\"%s\",\"ua\":\"%s\"}", 
+    json = sprintf("{\"ts\":\"%s\",\"event\":\"BROWSER\",\"ip\":\"%s\",\"user_agent\":\"%s\"}", 
                    ts, visitor_ip, json_escape(ua))
     emit(json)
     next
@@ -140,23 +173,13 @@ function get_ts() {
     gsub(/\r/, "", ref)
     ts = get_ts()
     
-    json = sprintf("{\"ts\":\"%s\",\"event\":\"REFERER\",\"visitor\":\"%s\",\"from\":\"%s\"}", 
+    json = sprintf("{\"ts\":\"%s\",\"event\":\"REFERER\",\"ip\":\"%s\",\"from\":\"%s\"}", 
                    ts, visitor_ip, json_escape(ref))
     emit(json)
     next
 }
 
-# Cookie header (just log that cookies were sent, not the values)
-/^Cookie: / {
-    if (visitor_ip == "") next
-    ts = get_ts()
-    
-    json = sprintf("{\"ts\":\"%s\",\"event\":\"HAS_COOKIES\",\"visitor\":\"%s\"}", ts, visitor_ip)
-    emit(json)
-    next
-}
-
-# Content-Type for POST data identification
+# Content-Type for POST data
 /^Content-Type: / {
     if (visitor_ip == "") next
     
@@ -164,18 +187,18 @@ function get_ts() {
     gsub(/\r/, "", ctype)
     ts = get_ts()
     
-    json = sprintf("{\"ts\":\"%s\",\"event\":\"CONTENT_TYPE\",\"visitor\":\"%s\",\"type\":\"%s\"}", 
+    json = sprintf("{\"ts\":\"%s\",\"event\":\"POST_TYPE\",\"ip\":\"%s\",\"content_type\":\"%s\"}", 
                    ts, visitor_ip, json_escape(ctype))
     emit(json)
     next
 }
 
-# TLS Client Hello (HTTPS connection attempt)
-/Client Hello/ {
+# TLS Client Hello (HTTPS connection)
+/Client Hello/ || /TLS/ {
     if (visitor_ip == "" || port != "443") next
     ts = get_ts()
     
-    json = sprintf("{\"ts\":\"%s\",\"event\":\"TLS_HANDSHAKE\",\"visitor\":\"%s\",\"port\":443}", ts, visitor_ip)
+    json = sprintf("{\"ts\":\"%s\",\"event\":\"HTTPS_HANDSHAKE\",\"ip\":\"%s\"}", ts, visitor_ip)
     emit(json)
     next
 }
