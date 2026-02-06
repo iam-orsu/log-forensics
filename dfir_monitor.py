@@ -84,6 +84,7 @@ class Config:
     IGNORE_USER_AGENTS = {
         'kube-probe', 'ELB-HealthChecker',
         'GoogleStackdriverMonitoring', 'Prometheus',
+        'WALinuxAgent',  # Azure noise
     }
     
     # Log retention
@@ -311,6 +312,10 @@ class HTTPParser:
     
     def parse_line(self, line: str) -> Optional[Dict]:
         """Parse tcpdump line for HTTP request."""
+        # 1. Skip port 22 (SSH) to avoid misidentifying scanner noise as HTTP
+        if '.22:' in line or '.22 >' in line:
+            return None
+            
         self.buffer.append(line)
         
         # Look for HTTP request line
