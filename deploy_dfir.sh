@@ -60,7 +60,9 @@ info "Installing dependencies..."
 # Detect package manager
 if command -v apt-get &> /dev/null; then
     export DEBIAN_FRONTEND=noninteractive
-    info "Fixing potential broken dependencies..."
+    info "Fixing potential broken dependencies and clearing old Zeek mess..."
+    # Forcefully remove problematic Zeek packages that are blocking apt
+    dpkg --remove --force-remove-reinstreq zeek zeek-lts zeek-core zeek-lts-core zeek-spicy-dev zeek-lts-spicy-dev zeek-btest-data zeek-lts-btest-data 2>/dev/null || true
     apt-get install -fy -qq
     info "Updating package lists..."
     apt-get update -qq
