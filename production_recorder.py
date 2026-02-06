@@ -1,186 +1,170 @@
 #!/usr/bin/env python3
 """
-UNIVERSAL Production Forensic Recorder
-=======================================
+UNIVERSAL FORENSIC RECORDER v2.0
+================================
 
-Works with ANY deployment: Docker, PM2, systemd, or bare metal.
+Captures EVERYTHING about website visitors:
+- Real IP (from X-Forwarded-For header)
+- Browser/Device (User-Agent)  
+- What they did (Method + URI)
+- What they typed (POST body - email, password, content)
 
-Captures on ALL interfaces and ALL common web ports to ensure
-nothing escapes logging.
-
-Output: /var/log/forensic_blackbox.log
+Filters out Azure health checks automatically.
 """
 
 import sys
 import re
 import json
-import os
-from datetime import datetime, timezone, timedelta
 import subprocess
 import signal
+from datetime import datetime, timezone, timedelta
+from collections import deque
 
 #===============================================================================
-# CONFIGURATION
+# CONFIG
 #===============================================================================
 
 LOG_FILE = "/var/log/forensic_blackbox.log"
 IST = timezone(timedelta(hours=5, minutes=30))
 
-# ALL common web ports - covers Docker, PM2, direct deployment
-WEB_PORTS = "80 or 443 or 3000 or 3001 or 5000 or 8000 or 8080 or 8443"
+# Ignore Azure health checks
+IGNORE_HOSTS = ['168.63.129.16', '169.254.169.254']
 
 #===============================================================================
-# PACKET PROCESSOR
+# PACKET PARSER
 #===============================================================================
 
-class PacketProcessor:
-    """Process tcpdump output and extract HTTP requests."""
+class HTTPExtractor:
+    """Extracts HTTP request details from raw packet data."""
     
     def __init__(self):
-        self.current_packet = []
-        self.in_packet = False
-        self.requests_logged = 0
+        self.packet_buffer = deque(maxlen=100)
+        self.seen_requests = set()  # Dedupe
     
-    def process_line(self, line: str) -> dict:
-        """Process a line from tcpdump and return request if complete."""
+    def feed(self, line: str):
+        """Feed a line from tcpdump."""
+        self.packet_buffer.append(line)
         
-        # Detect packet header (timestamp line)
-        if re.match(r'^\d{2}:\d{2}:\d{2}\.\d+', line):
-            # New packet starting, process previous if exists
-            result = self._parse_packet()
-            self.current_packet = [line]
-            self.in_packet = True
-            return result
-        elif self.in_packet:
-            self.current_packet.append(line)
-        
+        # Check if this line contains HTTP request
+        if re.search(r'(GET|POST|PUT|DELETE|PATCH)\s+\S+\s+HTTP', line):
+            return self._extract_request()
         return None
     
-    def _parse_packet(self) -> dict:
-        """Parse accumulated packet data."""
-        if not self.current_packet:
+    def _extract_request(self):
+        """Extract full HTTP request from buffer."""
+        # Join recent lines to get full packet
+        packet = '\n'.join(self.packet_buffer)
+        
+        # Extract HTTP method and URI
+        req_match = re.search(r'(GET|POST|PUT|DELETE|PATCH)\s+(\S+)\s+HTTP/[\d.]+', packet)
+        if not req_match:
             return None
         
-        packet_text = '\n'.join(self.current_packet)
+        method = req_match.group(1)
+        uri = req_match.group(2)
         
-        # Extract source IP from packet header
-        # Format: 12:34:56.789 IP 1.2.3.4.12345 > 5.6.7.8.80: ...
-        ip_match = re.search(r'IP\s+(\d+\.\d+\.\d+\.\d+)\.\d+\s+>', packet_text)
-        src_ip = ip_match.group(1) if ip_match else "Unknown"
-        
-        # Look for HTTP request line
-        http_match = re.search(
-            r'(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)\s+(\S+)\s+HTTP',
-            packet_text
-        )
-        
-        if not http_match:
+        # Dedupe (same request might appear multiple times)
+        req_key = f"{method}{uri}{len(packet)}"
+        if req_key in self.seen_requests:
             return None
-        
-        method = http_match.group(1)
-        uri = http_match.group(2)
+        self.seen_requests.add(req_key)
+        if len(self.seen_requests) > 1000:
+            self.seen_requests.clear()
         
         # Extract headers
-        host = self._extract_header(packet_text, 'Host')
-        user_agent = self._extract_header(packet_text, 'User-Agent')
-        content_type = self._extract_header(packet_text, 'Content-Type')
-        x_forwarded_for = self._extract_header(packet_text, 'X-Forwarded-For')
-        x_real_ip = self._extract_header(packet_text, 'X-Real-IP')
+        headers = {}
+        for match in re.finditer(r'^([A-Za-z-]+):\s*(.+?)(?:\r?\n|$)', packet, re.MULTILINE):
+            headers[match.group(1).lower()] = match.group(2).strip()
         
-        # Use X-Forwarded-For or X-Real-IP if available (real client IP behind proxy)
-        real_ip = x_forwarded_for.split(',')[0].strip() if x_forwarded_for else \
-                  x_real_ip if x_real_ip else src_ip
+        # Get REAL IP (X-Forwarded-For > X-Real-IP > packet source)
+        real_ip = None
+        if 'x-forwarded-for' in headers:
+            real_ip = headers['x-forwarded-for'].split(',')[0].strip()
+        elif 'x-real-ip' in headers:
+            real_ip = headers['x-real-ip'].strip()
+        else:
+            # Try to extract from packet header
+            ip_match = re.search(r'IP\s+(\d+\.\d+\.\d+\.\d+)\.\d+\s+>', packet)
+            if ip_match:
+                real_ip = ip_match.group(1)
         
-        # Extract POST body (everything after empty line in HTTP)
-        body = None
+        if not real_ip:
+            real_ip = "Unknown"
+        
+        # Skip Azure health checks
+        host = headers.get('host', '')
+        if any(h in host for h in IGNORE_HOSTS) or any(h in real_ip for h in IGNORE_HOSTS):
+            return None
+        
+        # Skip internal Docker IPs for display but keep the X-Forwarded-For
+        if real_ip.startswith('172.') or real_ip.startswith('10.'):
+            # This is internal, check if we have X-Forwarded-For
+            if 'x-forwarded-for' not in headers:
+                return None  # Skip pure internal traffic
+        
+        # Get User-Agent
+        user_agent = headers.get('user-agent', 'Unknown')
+        
+        # Extract POST body
+        post_body = None
         if method == 'POST':
-            body_match = re.search(r'\r?\n\r?\n(.+?)(?:\.\.\.|$)', packet_text, re.DOTALL)
-            if body_match:
-                body = body_match.group(1).strip()
-                body = self._parse_body(body, content_type)
+            # Look for JSON body
+            json_match = re.search(r'\{[^{}]*"[^"]+"\s*:\s*"[^"]*"[^{}]*\}', packet)
+            if json_match:
+                try:
+                    post_body = json.loads(json_match.group(0))
+                except:
+                    post_body = {"raw": json_match.group(0)[:200]}
+            else:
+                # Look for form data
+                form_match = re.search(r'(?:^|\n)([a-zA-Z_]+=.+?)(?:\n|$)', packet)
+                if form_match:
+                    post_body = {"form": form_match.group(1)[:200]}
         
         return {
             'timestamp': datetime.now(IST).strftime("%d-%m-%Y %I:%M:%S %p"),
-            'src_ip': real_ip,
+            'ip': real_ip,
             'method': method,
             'uri': uri,
-            'host': host or 'Unknown',
-            'user_agent': user_agent[:100] if user_agent else 'Unknown',
-            'post_data': body
+            'host': host,
+            'user_agent': user_agent[:150],
+            'post_data': post_body
         }
-    
-    def _extract_header(self, text: str, header_name: str) -> str:
-        """Extract a specific HTTP header value."""
-        match = re.search(rf'{header_name}:\s*([^\r\n]+)', text, re.IGNORECASE)
-        return match.group(1).strip() if match else ''
-    
-    def _parse_body(self, body: str, content_type: str) -> dict:
-        """Parse POST body based on content type."""
-        try:
-            # Try JSON
-            if 'json' in (content_type or '').lower():
-                return json.loads(body)
-            
-            # Try to parse as JSON anyway
-            return json.loads(body)
-        except:
-            pass
-        
-        try:
-            # URL-encoded form data
-            from urllib.parse import parse_qs
-            parsed = parse_qs(body)
-            return {k: v[0] if len(v) == 1 else v for k, v in parsed.items()}
-        except:
-            pass
-        
-        # Return raw (truncated)
-        return {"raw": body[:200]} if body else None
 
 
 #===============================================================================
 # LOGGER
 #===============================================================================
 
-class ForensicLogger:
-    """Write events to file and console."""
+def log_event(event: dict, log_file: str):
+    """Log event to file and console with colors."""
     
-    def __init__(self, log_path: str):
-        self.log_path = log_path
-        self.total = 0
-        
-        # Ensure file exists
-        open(log_path, 'a').close()
+    # Colors
+    R = '\033[91m'  # Red
+    G = '\033[92m'  # Green
+    Y = '\033[93m'  # Yellow
+    C = '\033[96m'  # Cyan
+    M = '\033[95m'  # Magenta
+    W = '\033[97m'  # White
+    X = '\033[0m'   # Reset
     
-    def log(self, event: dict):
-        """Log an event."""
-        self.total += 1
-        
-        # Write to file
-        with open(self.log_path, 'a') as f:
-            f.write(json.dumps(event, ensure_ascii=False) + '\n')
-        
-        # Print to console with colors
-        self._print_live(event)
+    method = event['method']
+    method_color = R if method == 'POST' else G
     
-    def _print_live(self, e: dict):
-        """Pretty print to console."""
-        RED = '\033[91m'
-        GREEN = '\033[92m'
-        YELLOW = '\033[93m'
-        CYAN = '\033[96m'
-        RESET = '\033[0m'
-        
-        method_color = RED if e['method'] == 'POST' else GREEN
-        
-        print(f"{CYAN}[{e['timestamp']}]{RESET} {method_color}{e['method']}{RESET} {e['uri']}")
-        print(f"    {YELLOW}IP:{RESET} {e['src_ip']}  {YELLOW}Host:{RESET} {e['host']}")
-        
-        if e.get('post_data'):
-            data_str = json.dumps(e['post_data'])[:150]
-            print(f"    {RED}DATA:{RESET} {data_str}")
-        
-        print()
+    # Console output
+    print(f"{C}[{event['timestamp']}]{X} {method_color}{method}{X} {event['uri']}")
+    print(f"    {Y}IP:{X} {W}{event['ip']}{X}")
+    print(f"    {Y}Host:{X} {event['host']}")
+    print(f"    {Y}Browser:{X} {event['user_agent'][:80]}")
+    
+    if event.get('post_data'):
+        print(f"    {R}DATA:{X} {M}{json.dumps(event['post_data'])[:200]}{X}")
+    
+    print()
+    
+    # File output
+    with open(log_file, 'a') as f:
+        f.write(json.dumps(event, ensure_ascii=False) + '\n')
 
 
 #===============================================================================
@@ -188,43 +172,34 @@ class ForensicLogger:
 #===============================================================================
 
 def main():
-    print("=" * 60)
-    print(" UNIVERSAL FORENSIC RECORDER")
-    print(" Works with: Docker / PM2 / Systemd / Bare Metal")
-    print("=" * 60)
+    print("=" * 70)
+    print(" UNIVERSAL FORENSIC RECORDER v2.0")
+    print(" Captures: IP | Browser | Actions | POST Data")
+    print("=" * 70)
     print()
-    print(f"[*] Interface: ALL (any)")
-    print(f"[*] Ports: {WEB_PORTS}")
-    print(f"[*] Log: {LOG_FILE}")
-    print(f"[*] Press Ctrl+C to stop")
+    print(f"Log File: {LOG_FILE}")
+    print("Press Ctrl+C to stop")
     print()
-    print("-" * 60)
+    print("-" * 70)
     print()
     
-    processor = PacketProcessor()
-    logger = ForensicLogger(LOG_FILE)
+    extractor = HTTPExtractor()
+    total = [0]
     
-    # Graceful shutdown
     def shutdown(sig, frame):
-        print(f"\n[*] Shutting down... Total logged: {logger.total}")
+        print(f"\n\n[*] Total requests captured: {total[0]}")
+        print(f"[*] Log saved to: {LOG_FILE}")
         sys.exit(0)
     
     signal.signal(signal.SIGINT, shutdown)
     signal.signal(signal.SIGTERM, shutdown)
     
-    # Build tcpdump command
-    # -i any     : ALL interfaces (universal)
-    # -A         : ASCII payload
-    # -s 0       : Full packet
-    # -l         : Line buffered
-    # -n         : No DNS lookups
-    port_filter = f"tcp and ({WEB_PORTS.replace(' or ', ' or port ')})"
-    port_filter = f"tcp and (port {WEB_PORTS.replace(' or ', ' or port ')})"
-    
-    cmd = ['tcpdump', '-i', 'any', '-A', '-s', '0', '-l', '-n', port_filter]
-    
-    print(f"[*] Running: {' '.join(cmd)}")
-    print()
+    # tcpdump command - capture on all interfaces, all web ports
+    cmd = [
+        'tcpdump', '-i', 'any', '-A', '-s', '0', '-l', '-n',
+        'tcp and (port 80 or port 443 or port 3000 or port 5000 or port 8080)',
+        'and not host 168.63.129.16'  # Exclude Azure health
+    ]
     
     try:
         proc = subprocess.Popen(
@@ -236,16 +211,16 @@ def main():
         )
         
         for line in proc.stdout:
-            event = processor.process_line(line)
+            event = extractor.feed(line)
             if event:
-                logger.log(event)
+                log_event(event, LOG_FILE)
+                total[0] += 1
     
     except FileNotFoundError:
-        print("[ERROR] tcpdump not found. Install: sudo apt install tcpdump")
+        print("[ERROR] tcpdump not found. Run: sudo apt install tcpdump")
         sys.exit(1)
-    except PermissionError:
-        print("[ERROR] Run with sudo: sudo python3 production_recorder.py")
-        sys.exit(1)
+    except KeyboardInterrupt:
+        shutdown(None, None)
 
 
 if __name__ == "__main__":
