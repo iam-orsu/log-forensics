@@ -9,12 +9,9 @@ set -euo pipefail
 # - Read-only (eBPF cannot modify data)
 # - Low overhead (~1-3% CPU)
 # - Auto-cleanup on exit
-# - Resource limits applied
 ########################################
 
 LOG_FILE="${1:-/var/log/https_monitor.jsonl}"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BPFTRACE_SCRIPT="${SCRIPT_DIR}/https_monitor.bt"
 
 export TZ="Asia/Kolkata"
 
@@ -50,7 +47,6 @@ info "Kernel version: $KERNEL_VERSION ✓"
 if ! command -v bpftrace &>/dev/null; then
     warn "bpftrace not installed. Installing now..."
     
-    # Detect package manager and install
     if command -v apt &>/dev/null; then
         apt update -qq && apt install -y bpftrace
     elif command -v dnf &>/dev/null; then
@@ -86,86 +82,32 @@ for lib in /lib/x86_64-linux-gnu/libssl.so.3 \
 done
 
 if [[ -z "$LIBSSL" ]]; then
-    error "OpenSSL library not found. Your web server may use a different SSL library."
+    error "OpenSSL library not found."
     exit 1
 fi
 info "OpenSSL found: $LIBSSL ✓"
 
-#------------------------------------------------------------------------------
-# Create dynamic bpftrace script with correct library path
-#------------------------------------------------------------------------------
-RUNTIME_SCRIPT=$(mktemp /tmp/https_monitor.XXXXXX.bt)
-
-cat > "$RUNTIME_SCRIPT" << 'BPFTRACE_EOF'
-#!/usr/bin/env bpftrace
-/*
- * HTTPS Traffic Monitor
- * Captures decrypted TLS data from SSL_read
- */
-
-BEGIN
-{
-    printf("{\"event\":\"START\",\"ts\":\"%s\"}\n", strftime("%Y-%m-%d %H:%M:%S IST", nsecs));
-}
-
-/* Save buffer pointer on SSL_read entry */
-LIBSSL_UPROBE:SSL_read
-{
-    @buf[tid] = arg1;
-    @ssl[tid] = arg0;
-}
-
-/* Read decrypted data on SSL_read return */
-LIBSSL_URETPROBE:SSL_read
-/retval > 0 && @buf[tid]/
-{
-    $len = retval < 400 ? retval : 400;
-    $data = str(@buf[tid], $len);
-    $ts = strftime("%Y-%m-%d %H:%M:%S IST", nsecs);
-    
-    /* Only print HTTP requests */
-    if (strcontains($data, "GET ") || 
-        strcontains($data, "POST ") || 
-        strcontains($data, "PUT ") ||
-        strcontains($data, "DELETE ") ||
-        strcontains($data, "HEAD ") ||
-        strcontains($data, "PATCH ") ||
-        strcontains($data, "OPTIONS "))
-    {
-        printf("{\"ts\":\"%s\",\"pid\":%d,\"process\":\"%s\",\"data\":\"%s\"}\n",
-               $ts, pid, comm, $data);
-    }
-    
-    delete(@buf[tid]);
-    delete(@ssl[tid]);
-}
-
-END
-{
-    printf("{\"event\":\"STOP\",\"ts\":\"%s\"}\n", strftime("%Y-%m-%d %H:%M:%S IST", nsecs));
-    clear(@buf);
-    clear(@ssl);
-}
-BPFTRACE_EOF
-
-# Replace library placeholders with actual path
-sed -i "s|LIBSSL_UPROBE|uprobe:${LIBSSL}|g" "$RUNTIME_SCRIPT"
-sed -i "s|LIBSSL_URETPROBE|uretprobe:${LIBSSL}|g" "$RUNTIME_SCRIPT"
-
-#------------------------------------------------------------------------------
-# Cleanup on exit
-#------------------------------------------------------------------------------
-cleanup() {
-    info "Stopping HTTPS monitor..."
-    rm -f "$RUNTIME_SCRIPT"
-    exit 0
-}
-trap cleanup SIGINT SIGTERM SIGHUP
+# Check if SSL_read symbol exists
+if ! nm -D "$LIBSSL" 2>/dev/null | grep -q "SSL_read"; then
+    error "SSL_read not found in $LIBSSL"
+    exit 1
+fi
+info "SSL_read symbol found ✓"
 
 #------------------------------------------------------------------------------
 # Create log directory
 #------------------------------------------------------------------------------
 mkdir -p "$(dirname "$LOG_FILE")"
+
+#------------------------------------------------------------------------------
+# Cleanup on exit
+#------------------------------------------------------------------------------
+cleanup() {
+    echo ""
+    info "Stopping HTTPS monitor..."
+    exit 0
+}
+trap cleanup SIGINT SIGTERM SIGHUP
 
 #------------------------------------------------------------------------------
 # Start monitoring
@@ -185,7 +127,43 @@ echo "  ✓ Low overhead (~1-3% CPU)"
 echo "  ✓ Auto-cleanup on Ctrl+C"
 echo ""
 info "Monitoring HTTPS traffic... Press Ctrl+C to stop"
+info "(Make some HTTPS requests to see output)"
 echo ""
 
-# Run bpftrace with output to both console and log file
-bpftrace "$RUNTIME_SCRIPT" 2>/dev/null | tee -a "$LOG_FILE"
+# Run bpftrace inline - more reliable than external file
+bpftrace -e "
+BEGIN
+{
+    printf(\"{\\\"event\\\":\\\"STARTED\\\",\\\"ts\\\":\\\"%s\\\"}\\n\", strftime(\"%Y-%m-%d %H:%M:%S IST\", nsecs));
+}
+
+uprobe:$LIBSSL:SSL_read
+{
+    @buf[tid] = arg1;
+}
+
+uretprobe:$LIBSSL:SSL_read
+/retval > 0/
+{
+    \$len = retval < 300 ? retval : 300;
+    \$data = str(@buf[tid], \$len);
+    \$ts = strftime(\"%Y-%m-%d %H:%M:%S IST\", nsecs);
+    
+    if (strcontains(\$data, \"GET \") || 
+        strcontains(\$data, \"POST \") || 
+        strcontains(\$data, \"PUT \") ||
+        strcontains(\$data, \"DELETE \") ||
+        strcontains(\$data, \"HEAD \"))
+    {
+        printf(\"{\\\"ts\\\":\\\"%s\\\",\\\"pid\\\":%d,\\\"process\\\":\\\"%s\\\",\\\"request\\\":\\\"%s\\\"}\\n\",
+               \$ts, pid, comm, \$data);
+    }
+    delete(@buf[tid]);
+}
+
+END
+{
+    printf(\"{\\\"event\\\":\\\"STOPPED\\\"}\\n\");
+    clear(@buf);
+}
+" 2>&1 | tee -a "$LOG_FILE"
