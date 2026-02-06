@@ -72,10 +72,10 @@ detect_interface() {
 
 install_dependencies_debian() {
     log_info "Updating package lists..."
-    apt-get update -qq
+    DEBIAN_FRONTEND=noninteractive apt-get update -qq
 
     log_info "Installing core dependencies..."
-    apt-get install -y -qq python3 python3-pip auditd audispd-plugins curl gnupg
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3 python3-pip auditd audispd-plugins curl gnupg
 
     # Install Zeek from official repository
     if ! command -v zeek &> /dev/null; then
@@ -84,10 +84,10 @@ install_dependencies_debian() {
             tee /etc/apt/sources.list.d/security:zeek.list
         curl -fsSL 'https://download.opensuse.org/repositories/security:zeek/xUbuntu_22.04/Release.key' | \
             gpg --dearmor | tee /etc/apt/trusted.gpg.d/security_zeek.gpg > /dev/null
-        apt-get update -qq
-        apt-get install -y -qq zeek || {
+        DEBIAN_FRONTEND=noninteractive apt-get update -qq
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq zeek || {
             log_warn "Zeek repo install failed, trying zeek-lts..."
-            apt-get install -y -qq zeek-lts || true
+            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq zeek-lts || true
         }
     fi
 }
@@ -220,28 +220,19 @@ configure_zeek() {
 ##! DFIR Monitor - Zeek Configuration
 ##! Optimized for forensic evidence collection
 
-# Load standard scripts
+# Load base scripts
+@load base/frameworks/logging
 @load base/frameworks/files
 @load base/protocols/conn
 @load base/protocols/dns
 @load base/protocols/http
 @load base/protocols/ssl
-@load frameworks/files/hash-all-files
-@load policy/protocols/conn/known-hosts
-@load policy/protocols/conn/known-services
-@load policy/protocols/ssl/validate-certs
 
 # Enable JSON logging (CRITICAL for parsing)
 redef LogAscii::use_json = T;
 
-# Increase connection tracking for high-traffic servers
-redef ConnSplitter::max_connections = 1000000;
-
-# Log more SSL/TLS details
-redef SSL::log_x509_cert_data = T;
-
-# Capture JA3 fingerprints (if available)
-@load policy/protocols/ssl/ja3
+# Optional: Log cert data if available
+# @load policy/protocols/ssl/validate-certs
 EOF
 
     # Configure node.cfg for interface
