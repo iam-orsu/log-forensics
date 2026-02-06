@@ -60,7 +60,11 @@ info "Installing dependencies..."
 # Detect package manager
 if command -v apt-get &> /dev/null; then
     export DEBIAN_FRONTEND=noninteractive
+    info "Fixing potential broken dependencies..."
+    apt-get install -fy -qq
+    info "Updating package lists..."
     apt-get update -qq
+    info "Installing tcpdump..."
     apt-get install -y -qq tcpdump
 elif command -v yum &> /dev/null; then
     yum install -y -q tcpdump
