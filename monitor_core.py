@@ -52,7 +52,12 @@ class Config:
         "/var/log/nginx/access.log",
         "/var/log/apache2/access.log",
         "/var/log/httpd/access_log",
+        # Added Docker Volume paths (common in ~/crud/nginx/logs)
+        os.path.expanduser("~/crud/nginx/logs/access.log"),
     ]
+    
+    # Custom log paths (passed via env)
+    CUSTOM_LOG_PATHS = os.getenv("DFIR_CUSTOM_LOGS", "").split(",")
     
     AUTH_LOG_PATHS = [
         "/var/log/auth.log",        # Debian/Ubuntu
@@ -327,7 +332,8 @@ class AuditdReader:
 class EventParser:
     """Parse raw log lines into normalized event dictionaries."""
     
-    # Regex patterns for web logs (Combined Log Format)
+    # Regex for web logs with potential [USER:email] or [USER:name] suffix
+    # This helps catch the "Black Sheep" if you log the user ID
     WEB_LOG_PATTERN = re.compile(
         r'^(?P<ip>[\d.]+)\s+'                          # Source IP
         r'(?P<ident>\S+)\s+'                           # Ident
@@ -336,8 +342,9 @@ class EventParser:
         r'"(?P<method>\w+)\s+(?P<uri>\S+)\s+\S+"\s+'   # Request
         r'(?P<status>\d+)\s+'                          # Status code
         r'(?P<size>\d+|-)\s*'                          # Size
-        r'(?:"(?P<referrer>[^"]*)"\s*)?'               # Referrer (optional)
-        r'(?:"(?P<user_agent>[^"]*)")?'                # User-Agent (optional)
+        r'(?:"(?P<referrer>[^"]*)"\s*)?'               # Referrer
+        r'(?:"(?P<user_agent>[^"]*)")?'                # User-Agent
+        r'(?:\s+\[USER:(?P<app_user>[^\]]+)\])?'       # Optional App User ID
     )
     
     # Regex patterns for auth.log
@@ -382,6 +389,7 @@ class EventParser:
                 "size": int(data['size']) if data['size'] != '-' else 0,
                 "user_agent": data.get('user_agent', ''),
                 "referrer": data.get('referrer', ''),
+                "app_user": data.get('app_user', 'anonymous'), # The "Black Sheep" Tracker
                 "raw_log": line
             }
         }
@@ -703,6 +711,13 @@ class DFIRMonitor:
     def _init_tailers(self):
         """Initialize log file tailers for each source."""
         
+        # Custom logs from environment
+        for path in Config.CUSTOM_LOG_PATHS:
+            path = path.strip()
+            if path and os.path.exists(path):
+                self.tailers[f"custom:{path}"] = LogTailer(path, "custom")
+                print(f"[DFIR Monitor] Tailing custom log: {path}")
+
         # Web server logs (auto-detect)
         for path in Config.WEB_LOG_PATHS:
             if os.path.exists(path):

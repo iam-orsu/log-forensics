@@ -546,6 +546,9 @@ main() {
     echo "  View live logs: tail -f $LOG_FILE | jq ."
     echo "  Search logs:    zgrep 'pattern' /var/log/dfir_monitor.json*.gz"
     echo ""
+    log_info "HINT: To find the 'Black Sheep' (insider threats),"
+    log_info "Make sure your web app in ~/crud/ server logs the username!"
+    echo ""
 }
 
 main "$@"
