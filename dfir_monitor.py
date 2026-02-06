@@ -638,7 +638,6 @@ class DFIRMonitor:
         def monitor():
             cmd = [
                 'tcpdump', '-i', 'any', '-A', '-s', '0', '-l', '-n',
-                '-Q', 'in',  # Incoming traffic only
                 'tcp'
             ]
             
