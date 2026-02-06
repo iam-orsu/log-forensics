@@ -131,6 +131,7 @@ info "(Make some HTTPS requests to see output)"
 echo ""
 
 # Run bpftrace inline - more reliable than external file
+# NOTE: Using small buffer (64 bytes) to avoid BPF stack limit
 bpftrace -e "
 BEGIN
 {
@@ -145,8 +146,7 @@ uprobe:$LIBSSL:SSL_read
 uretprobe:$LIBSSL:SSL_read
 /retval > 0/
 {
-    \$len = retval < 300 ? retval : 300;
-    \$data = str(@buf[tid], \$len);
+    \$data = str(@buf[tid], 64);
     \$ts = strftime(\"%Y-%m-%d %H:%M:%S IST\", nsecs);
     
     if (strcontains(\$data, \"GET \") || 
