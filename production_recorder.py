@@ -1,23 +1,27 @@
 #!/usr/bin/env python3
 """
 ================================================================================
-FORENSIC BLACK BOX RECORDER - Criminal Investigation Grade
+FORENSIC BLACK BOX RECORDER v3.0 - Enterprise Criminal Investigation Grade
 ================================================================================
 
-Enterprise-level evidence collection system for legal prosecution.
+FEATURES:
+  - Captures ALL HTTP methods (GET/POST/PUT/DELETE/PATCH)
+  - Extracts body data for POST/PUT/DELETE (what exactly was modified/deleted)
+  - Smart filtering to reduce false positives
+  - Session correlation via cookies/tokens
+  - Request timeline reconstruction
+  - Court-admissible integrity hashing (SHA256)
 
 MODULES:
-  1. IDENTITY     - Real IP, Geo-Location hints, Device fingerprint
-  2. BEHAVIOR     - Full request chain, session tracking
-  3. THREAT       - SQL Injection, XSS, Path Traversal detection
-  4. EVIDENCE     - POST bodies, form data, file uploads
-  5. INTEGRITY    - SHA256 hash of each log entry for court admissibility
+  1. IDENTITY     - Real IP, Device fingerprint, Session tracking
+  2. BEHAVIOR     - Method, URI, Parameters, Timing
+  3. EVIDENCE     - Request body for ALL modifying methods
+  4. THREAT       - SQLi, XSS, Path Traversal, Scanner detection
+  5. INTEGRITY    - SHA256 hash for legal admissibility
 
-DEPLOYMENT:
-  - Runs as background daemon (systemd service)
-  - Logs to /var/log/forensic_blackbox.log (append mode)
-  - Auto-rotates via logrotate
-  - Zero impact on web application performance
+USAGE:
+  Foreground:  sudo python3 production_recorder.py
+  Background:  sudo python3 production_recorder.py --daemon
 
 ================================================================================
 """
@@ -30,7 +34,6 @@ import hashlib
 import subprocess
 import signal
 import time
-import socket
 from datetime import datetime, timezone, timedelta
 from collections import deque
 from typing import Optional, Dict, List
@@ -45,220 +48,358 @@ class Config:
     PID_FILE = "/var/run/forensic_recorder.pid"
     IST = timezone(timedelta(hours=5, minutes=30))
     
-    # Monitor ALL ports (universal capture)
-    WEB_PORTS = "ALL"  # Captures on all TCP ports
+    # Monitor ALL ports
+    WEB_PORTS = "ALL"
     
-    # Ignore internal health checks
-    IGNORE_HOSTS = ['127.0.0.1']
-    IGNORE_PATHS = ['/health', '/healthz', '/ready', '/metrics', '/favicon.ico']
+    # Noise reduction - ignore these completely
+    IGNORE_HOSTS = [
+        '168.63.129.16',   # Azure health
+        '169.254.169.254', # Cloud metadata
+    ]
     
-    # Buffer settings
-    BUFFER_SIZE = 50
-    FLUSH_INTERVAL = 2.0  # seconds
+    IGNORE_PATHS = [
+        '/health', '/healthz', '/ready', '/metrics',
+        '/favicon.ico', '/.well-known/',
+        '/machine', '/HealthService',  # Azure internals
+    ]
+    
+    IGNORE_USER_AGENTS = [
+        'kube-probe',
+        'ELB-HealthChecker',
+        'GoogleStackdriverMonitoring',
+    ]
+    
+    # Only log requests to these hosts (your domains)
+    # Leave empty to log all hosts
+    ALLOWED_HOSTS = []  # e.g., ['learnwithorsu.xyz', 'api.example.com']
+    
+    # Buffer for performance
+    BUFFER_SIZE = 20
+    FLUSH_INTERVAL = 1.0
 
 
 #===============================================================================
-# MODULE 1: THREAT DETECTION
+# THREAT DETECTOR (Improved - fewer false positives)
 #===============================================================================
 
 class ThreatDetector:
-    """Detect malicious patterns in requests."""
+    """Detect malicious patterns with reduced false positives."""
     
+    # More precise patterns
     PATTERNS = {
         'sql_injection': [
-            r"('|\")\s*(OR|AND)\s*('|\")?\s*\d+\s*=\s*\d+",
-            r"UNION\s+(ALL\s+)?SELECT",
-            r";\s*(DROP|DELETE|UPDATE|INSERT)\s+",
-            r"--\s*$",
-            r"/\*.*\*/",
+            r"'\s*(OR|AND)\s+['\"]?\d+['\"]?\s*=\s*['\"]?\d+",
+            r"UNION\s+ALL\s+SELECT",
+            r";\s*(DROP|DELETE|TRUNCATE)\s+(TABLE|DATABASE)",
+            r"'\s*;\s*--",
         ],
         'xss_attack': [
-            r"<script[^>]*>",
-            r"javascript\s*:",
-            r"on(load|error|click|mouse)\s*=",
-            r"<iframe[^>]*>",
+            r"<script[^>]*>[^<]*</script>",
+            r"javascript\s*:\s*[a-z]+\s*\(",
+            r"onerror\s*=\s*['\"]",
+            r"onload\s*=\s*['\"]",
         ],
         'path_traversal': [
-            r"\.\./",
-            r"\.\.\\",
-            r"%2e%2e[%/\\]",
-            r"/etc/(passwd|shadow)",
-            r"/proc/self",
+            r"\.\./(\.\./)+(etc|var|usr|root)",
+            r"/etc/(passwd|shadow|hosts)",
+            r"/proc/self/",
         ],
-        'command_injection': [
-            r";\s*(ls|cat|wget|curl|nc|bash|sh)\s",
-            r"\|\s*(ls|cat|wget|curl|nc|bash|sh)\s",
-            r"`[^`]+`",
-            r"\$\([^)]+\)",
+        'rce_attempt': [
+            r";\s*(bash|sh|nc|wget|curl)\s+-",
+            r"\|\s*(bash|sh)\s*$",
+            r"`[^`]+(cat|ls|id|whoami)[^`]*`",
         ],
-        'scanner_signature': [
-            r"sqlmap",
-            r"nikto",
-            r"nmap",
-            r"burp",
-            r"acunetix",
-            r"nessus",
-            r"masscan",
+        'scanner_tool': [
+            r"(sqlmap|nikto|nessus|acunetix|burp\s*suite)",
+            r"masscan|zmap|nmap",
         ],
     }
     
     @classmethod
-    def analyze(cls, uri: str, body: str, user_agent: str) -> List[str]:
-        """Analyze request for threats. Returns list of detected threat types."""
+    def analyze(cls, uri: str, body: str, user_agent: str) -> List[Dict]:
+        """Returns list of detected threats with details."""
         threats = []
-        content = f"{uri} {body} {user_agent}".lower()
+        content = f"{uri} {body}".lower()
+        ua_lower = user_agent.lower()
         
         for threat_type, patterns in cls.PATTERNS.items():
             for pattern in patterns:
-                if re.search(pattern, content, re.IGNORECASE):
-                    threats.append(threat_type)
+                match = re.search(pattern, content if threat_type != 'scanner_tool' else ua_lower, re.IGNORECASE)
+                if match:
+                    threats.append({
+                        'type': threat_type,
+                        'pattern_matched': match.group(0)[:50],
+                        'severity': 'CRITICAL' if threat_type in ['sql_injection', 'rce_attempt'] else 'HIGH'
+                    })
                     break
         
         return threats
 
 
 #===============================================================================
-# MODULE 2: IDENTITY EXTRACTION
+# IDENTITY EXTRACTOR
 #===============================================================================
 
 class IdentityExtractor:
-    """Extract visitor identity information."""
+    """Extract visitor identity with session tracking."""
     
     @staticmethod
     def get_real_ip(headers: Dict[str, str], packet_ip: str) -> str:
-        """Get real client IP from headers."""
-        # Priority: CF-Connecting-IP > X-Forwarded-For > X-Real-IP > packet
-        for header in ['cf-connecting-ip', 'x-forwarded-for', 'x-real-ip']:
+        for header in ['cf-connecting-ip', 'x-forwarded-for', 'x-real-ip', 'true-client-ip']:
             if header in headers:
                 ip = headers[header].split(',')[0].strip()
-                if ip and not ip.startswith(('172.', '10.', '192.168.')):
+                if ip and not ip.startswith(('172.', '10.', '192.168.', '127.')):
                     return ip
         return packet_ip
     
     @staticmethod
-    def get_device_fingerprint(headers: Dict[str, str]) -> Dict:
-        """Extract device fingerprint from headers."""
+    def get_session_id(headers: Dict[str, str]) -> Optional[str]:
+        """Extract session identifier for request correlation."""
+        # Check Authorization header (JWT/Bearer)
+        auth = headers.get('authorization', '')
+        if auth.startswith('Bearer '):
+            token = auth[7:]
+            return f"jwt:{hashlib.md5(token.encode()).hexdigest()[:8]}"
+        
+        # Check cookies for session
+        cookies = headers.get('cookie', '')
+        for cookie in cookies.split(';'):
+            if '=' in cookie:
+                name, value = cookie.strip().split('=', 1)
+                if name.lower() in ['session', 'sessionid', 'sid', 'token', 'auth']:
+                    return f"cookie:{hashlib.md5(value.encode()).hexdigest()[:8]}"
+        
+        return None
+    
+    @staticmethod
+    def get_device_info(headers: Dict[str, str]) -> Dict:
         ua = headers.get('user-agent', '')
         
-        # Detect OS
+        # OS Detection
         os_name = 'Unknown'
-        if 'Windows' in ua:
+        if 'Windows NT 10' in ua:
+            os_name = 'Windows 10/11'
+        elif 'Windows' in ua:
             os_name = 'Windows'
-        elif 'Mac OS' in ua or 'Macintosh' in ua:
+        elif 'Mac OS X' in ua:
             os_name = 'macOS'
-        elif 'Linux' in ua:
-            os_name = 'Linux'
         elif 'Android' in ua:
             os_name = 'Android'
-        elif 'iPhone' in ua or 'iPad' in ua:
-            os_name = 'iOS'
+        elif 'iPhone' in ua:
+            os_name = 'iPhone'
+        elif 'iPad' in ua:
+            os_name = 'iPad'
+        elif 'Linux' in ua:
+            os_name = 'Linux'
         
-        # Detect Browser
+        # Browser Detection
         browser = 'Unknown'
-        if 'Chrome' in ua and 'Edg' not in ua:
-            browser = 'Chrome'
-        elif 'Firefox' in ua:
-            browser = 'Firefox'
-        elif 'Safari' in ua and 'Chrome' not in ua:
-            browser = 'Safari'
-        elif 'Edg' in ua:
-            browser = 'Edge'
+        browser_version = ''
         
-        # Detect if mobile
+        if 'Edg/' in ua:
+            browser = 'Edge'
+            m = re.search(r'Edg/(\d+)', ua)
+            browser_version = m.group(1) if m else ''
+        elif 'Chrome/' in ua and 'Edg' not in ua:
+            browser = 'Chrome'
+            m = re.search(r'Chrome/(\d+)', ua)
+            browser_version = m.group(1) if m else ''
+        elif 'Firefox/' in ua:
+            browser = 'Firefox'
+            m = re.search(r'Firefox/(\d+)', ua)
+            browser_version = m.group(1) if m else ''
+        elif 'Safari/' in ua and 'Chrome' not in ua:
+            browser = 'Safari'
+        
         is_mobile = any(x in ua.lower() for x in ['mobile', 'android', 'iphone', 'ipad'])
         
         return {
             'os': os_name,
-            'browser': browser,
+            'browser': f"{browser} {browser_version}".strip(),
             'is_mobile': is_mobile,
             'raw_ua': ua[:200]
         }
-    
-    @staticmethod
-    def get_country_hint(ip: str) -> str:
-        """Get country hint from IP (basic heuristic)."""
-        # This is a placeholder - in production, use MaxMind GeoIP
-        if ip.startswith('103.'):
-            return 'IN'  # India
-        elif ip.startswith('104.') or ip.startswith('172.'):
-            return 'US'  # USA (Cloudflare/internal)
-        return 'XX'
 
 
 #===============================================================================
-# MODULE 3: EVIDENCE EXTRACTOR
+# EVIDENCE EXTRACTOR (Enhanced - captures ALL method bodies)
 #===============================================================================
 
 class EvidenceExtractor:
-    """Extract evidence from HTTP requests."""
+    """Extract evidence from ALL HTTP methods."""
     
     @staticmethod
-    def extract_body(packet: str, method: str, content_type: str) -> Optional[Dict]:
-        """Extract and parse POST body."""
-        if method != 'POST':
+    def extract_body(packet: str, method: str) -> Optional[Dict]:
+        """Extract body for POST, PUT, DELETE, PATCH methods."""
+        # Only extract body for modifying methods
+        if method not in ['POST', 'PUT', 'DELETE', 'PATCH']:
             return None
         
         body = None
         
-        # JSON body
-        json_match = re.search(r'\{[^{}]*"[^"]+"\s*:\s*[^{}]+\}', packet)
-        if json_match:
-            try:
-                body = json.loads(json_match.group(0))
-            except:
-                body = {'raw': json_match.group(0)[:500]}
+        # Try to find JSON body (most common for APIs)
+        # Look for JSON object that spans multiple lines or single line
+        json_patterns = [
+            r'\{(?:[^{}]|\{[^{}]*\})*\}',  # Nested JSON
+            r'\{[^{}]+\}',  # Simple JSON
+        ]
         
-        # URL-encoded form
+        for pattern in json_patterns:
+            json_match = re.search(pattern, packet, re.DOTALL)
+            if json_match:
+                try:
+                    candidate = json_match.group(0)
+                    # Verify it's valid JSON
+                    parsed = json.loads(candidate)
+                    if isinstance(parsed, dict) and len(parsed) > 0:
+                        body = parsed
+                        break
+                except:
+                    continue
+        
+        # Try URL-encoded form data
         if not body:
-            form_match = re.search(r'(?:^|\n)([a-zA-Z_][a-zA-Z0-9_]*=[^&\n]+(?:&[a-zA-Z_][a-zA-Z0-9_]*=[^&\n]+)*)', packet)
+            form_match = re.search(
+                r'(?:^|\n)([a-zA-Z_][a-zA-Z0-9_]*=[^&\n\r]+(?:&[a-zA-Z_][a-zA-Z0-9_]*=[^&\n\r]+)*)',
+                packet
+            )
             if form_match:
                 try:
-                    from urllib.parse import parse_qs
+                    from urllib.parse import parse_qs, unquote
                     parsed = parse_qs(form_match.group(1))
-                    body = {k: v[0] if len(v) == 1 else v for k, v in parsed.items()}
+                    body = {k: unquote(v[0]) if len(v) == 1 else [unquote(x) for x in v] 
+                            for k, v in parsed.items()}
                 except:
-                    body = {'raw': form_match.group(1)[:500]}
+                    body = {'raw_form': form_match.group(1)[:300]}
         
         return body
     
     @staticmethod
-    def classify_endpoint(uri: str, method: str) -> str:
-        """Classify the endpoint for investigation categories."""
+    def extract_uri_params(uri: str) -> Dict:
+        """Extract query parameters from URI."""
+        if '?' not in uri:
+            return {}
+        
+        try:
+            from urllib.parse import parse_qs, urlparse
+            parsed = urlparse(uri)
+            params = parse_qs(parsed.query)
+            return {k: v[0] if len(v) == 1 else v for k, v in params.items()}
+        except:
+            return {}
+    
+    @staticmethod
+    def extract_resource_id(uri: str) -> Optional[str]:
+        """Extract resource ID from URI (for DELETE tracking)."""
+        # Common patterns: /api/items/123, /users/abc-def, /posts/456
+        patterns = [
+            r'/([a-f0-9-]{20,})',  # UUID
+            r'/(\d+)(?:/|$)',      # Numeric ID
+            r'/([a-zA-Z0-9_-]{8,})(?:/|$)',  # String ID
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, uri)
+            if match:
+                return match.group(1)
+        
+        return None
+    
+    @staticmethod
+    def classify_action(uri: str, method: str) -> Dict:
+        """Detailed action classification."""
         uri_lower = uri.lower()
         
-        if any(x in uri_lower for x in ['/login', '/signin', '/auth']):
-            return 'AUTHENTICATION'
-        elif any(x in uri_lower for x in ['/signup', '/register']):
-            return 'REGISTRATION'
-        elif any(x in uri_lower for x in ['/admin', '/dashboard', '/manage']):
-            return 'ADMIN_ACCESS'
-        elif any(x in uri_lower for x in ['/api/user', '/profile', '/account']):
-            return 'USER_DATA'
-        elif any(x in uri_lower for x in ['/payment', '/checkout', '/billing']):
-            return 'FINANCIAL'
-        elif any(x in uri_lower for x in ['/upload', '/file', '/download']):
-            return 'FILE_OPERATION'
-        elif any(x in uri_lower for x in ['/delete', '/remove']):
-            return 'DESTRUCTIVE'
+        # Determine resource type
+        resource = 'unknown'
+        for r in ['user', 'item', 'post', 'comment', 'order', 'product', 'file', 'image', 'document']:
+            if r in uri_lower:
+                resource = r
+                break
+        
+        # Determine action
+        action = 'unknown'
+        if method == 'GET':
+            action = 'read'
         elif method == 'POST':
-            return 'DATA_MODIFICATION'
-        else:
-            return 'GENERAL'
+            if '/login' in uri_lower or '/signin' in uri_lower:
+                action = 'login'
+            elif '/signup' in uri_lower or '/register' in uri_lower:
+                action = 'register'
+            else:
+                action = 'create'
+        elif method == 'PUT' or method == 'PATCH':
+            action = 'update'
+        elif method == 'DELETE':
+            action = 'delete'
+        
+        # Determine sensitivity
+        sensitivity = 'LOW'
+        if any(x in uri_lower for x in ['/admin', '/manage', '/config', '/setting']):
+            sensitivity = 'CRITICAL'
+        elif any(x in uri_lower for x in ['/user', '/profile', '/account', '/password']):
+            sensitivity = 'HIGH'
+        elif any(x in uri_lower for x in ['/payment', '/billing', '/order']):
+            sensitivity = 'CRITICAL'
+        elif method in ['DELETE', 'PUT', 'PATCH']:
+            sensitivity = 'MEDIUM'
+        
+        return {
+            'action': action,
+            'resource': resource,
+            'sensitivity': sensitivity,
+            'is_destructive': method == 'DELETE' or 'delete' in uri_lower,
+        }
 
 
 #===============================================================================
-# MODULE 4: PACKET PROCESSOR
+# PACKET PROCESSOR
 #===============================================================================
 
 class PacketProcessor:
-    """Process tcpdump output into forensic records."""
+    """Process tcpdump output with smart filtering."""
     
     def __init__(self):
-        self.buffer = deque(maxlen=150)
-        self.seen = set()
+        self.buffer = deque(maxlen=200)
+        self.seen = {}  # For deduplication with timestamps
+    
+    def should_ignore(self, host: str, uri: str, user_agent: str, ip: str) -> bool:
+        """Check if request should be ignored (noise reduction)."""
+        # Ignore health check hosts
+        if any(h in host for h in Config.IGNORE_HOSTS):
+            return True
+        if any(h in ip for h in Config.IGNORE_HOSTS):
+            return True
+        
+        # Ignore health check paths
+        if any(uri.startswith(p) or p in uri for p in Config.IGNORE_PATHS):
+            return True
+        
+        # Ignore monitoring user agents
+        if any(ua in user_agent for ua in Config.IGNORE_USER_AGENTS):
+            return True
+        
+        # If ALLOWED_HOSTS is set, only allow those
+        if Config.ALLOWED_HOSTS and not any(h in host for h in Config.ALLOWED_HOSTS):
+            return True
+        
+        return False
+    
+    def is_duplicate(self, key: str) -> bool:
+        """Check for duplicate with 1-second window."""
+        now = time.time()
+        
+        # Clean old entries
+        self.seen = {k: v for k, v in self.seen.items() if now - v < 1.0}
+        
+        if key in self.seen:
+            return True
+        
+        self.seen[key] = now
+        return False
     
     def process(self, line: str) -> Optional[Dict]:
-        """Process a line from tcpdump."""
+        """Process tcpdump line and return forensic record if valid."""
         self.buffer.append(line)
         
         # Check for HTTP request
@@ -275,168 +416,148 @@ class PacketProcessor:
         method = req_match.group(1)
         uri = req_match.group(2)
         
-        # Dedupe
-        req_key = f"{method}{uri}{hash(packet[-500:])}"
-        if req_key in self.seen:
-            return None
-        self.seen.add(req_key)
-        if len(self.seen) > 2000:
-            self.seen.clear()
-        
         # Extract headers
         headers = {}
         for m in re.finditer(r'^([A-Za-z-]+):\s*(.+?)(?:\r?\n|$)', packet, re.MULTILINE):
             headers[m.group(1).lower()] = m.group(2).strip()
         
-        # Skip ignored paths and hosts
         host = headers.get('host', '')
-        if any(h in host for h in Config.IGNORE_HOSTS):
-            return None
-        if any(uri.startswith(p) for p in Config.IGNORE_PATHS):
-            return None
+        user_agent = headers.get('user-agent', '')
         
-        # Extract packet source IP
+        # Extract IP
         ip_match = re.search(r'IP\s+(\d+\.\d+\.\d+\.\d+)\.\d+\s+>', packet)
         packet_ip = ip_match.group(1) if ip_match else 'Unknown'
-        
-        # Get real IP
         real_ip = IdentityExtractor.get_real_ip(headers, packet_ip)
         
-        # Skip internal-only traffic
+        # Noise filtering
+        if self.should_ignore(host, uri, user_agent, real_ip):
+            return None
+        
+        # Skip pure internal traffic without X-Forwarded-For
         if real_ip.startswith(('172.', '10.', '192.168.')) and 'x-forwarded-for' not in headers:
             return None
         
-        # Get device fingerprint
-        device = IdentityExtractor.get_device_fingerprint(headers)
+        # Deduplication
+        dedup_key = f"{method}:{uri}:{real_ip}"
+        if self.is_duplicate(dedup_key):
+            return None
         
-        # Get country hint
-        country = IdentityExtractor.get_country_hint(real_ip)
+        # Get all the details
+        device = IdentityExtractor.get_device_info(headers)
+        session_id = IdentityExtractor.get_session_id(headers)
+        body = EvidenceExtractor.extract_body(packet, method)
+        uri_params = EvidenceExtractor.extract_uri_params(uri)
+        resource_id = EvidenceExtractor.extract_resource_id(uri)
+        action_info = EvidenceExtractor.classify_action(uri, method)
         
-        # Extract body
-        content_type = headers.get('content-type', '')
-        body = EvidenceExtractor.extract_body(packet, method, content_type)
-        
-        # Classify endpoint
-        category = EvidenceExtractor.classify_endpoint(uri, method)
-        
-        # Detect threats
+        # Threat detection
         body_str = json.dumps(body) if body else ''
-        threats = ThreatDetector.analyze(uri, body_str, device['raw_ua'])
+        threats = ThreatDetector.analyze(uri + str(uri_params), body_str, user_agent)
         
         # Build forensic record
         timestamp = datetime.now(Config.IST)
         
         record = {
-            'id': hashlib.md5(f"{timestamp}{real_ip}{uri}".encode()).hexdigest()[:12],
+            'id': hashlib.md5(f"{timestamp.isoformat()}{real_ip}{uri}".encode()).hexdigest()[:12],
             'timestamp': timestamp.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "+05:30",
-            'timestamp_human': timestamp.strftime("%d-%m-%Y %I:%M:%S %p IST"),
+            'timestamp_display': timestamp.strftime("%d-%m-%Y %I:%M:%S %p"),
+            
             'identity': {
                 'ip': real_ip,
-                'country': country,
+                'session': session_id,
                 'device': device['os'],
                 'browser': device['browser'],
                 'is_mobile': device['is_mobile'],
             },
+            
             'request': {
                 'method': method,
                 'uri': uri,
                 'host': host,
-                'category': category,
+                'params': uri_params if uri_params else None,
             },
+            
+            'action': action_info,
+            
             'evidence': {
-                'post_data': body,
+                'resource_id': resource_id,
+                'body': body,
                 'user_agent': device['raw_ua'],
-                'referer': headers.get('referer', ''),
+                'referer': headers.get('referer'),
             },
+            
             'security': {
-                'threats_detected': threats,
-                'risk_level': 'HIGH' if threats else 'NORMAL',
+                'threats': threats if threats else None,
+                'risk_level': threats[0]['severity'] if threats else 'NORMAL',
             },
-            'integrity': {
-                'record_hash': '',  # Will be set below
-            }
         }
         
-        # Calculate integrity hash (for court admissibility)
-        record_str = json.dumps(record, sort_keys=True)
-        record['integrity']['record_hash'] = hashlib.sha256(record_str.encode()).hexdigest()
+        # Calculate integrity hash
+        record_json = json.dumps(record, sort_keys=True)
+        record['integrity_hash'] = hashlib.sha256(record_json.encode()).hexdigest()
         
         return record
 
 
 #===============================================================================
-# MODULE 5: FORENSIC LOGGER
+# LOGGER
 #===============================================================================
 
 class ForensicLogger:
-    """Thread-safe buffered logger with integrity verification."""
-    
     def __init__(self, log_path: str):
         self.log_path = log_path
         self.buffer = []
         self.lock = threading.Lock()
-        self.total = 0
-        self.threats = 0
+        self.stats = {'total': 0, 'threats': 0, 'deletes': 0}
         self.last_flush = time.time()
-        
-        # Ensure log file exists
         open(log_path, 'a').close()
     
     def log(self, record: Dict):
-        """Add record to buffer."""
         with self.lock:
             self.buffer.append(record)
-            self.total += 1
-            if record['security']['threats_detected']:
-                self.threats += 1
+            self.stats['total'] += 1
+            if record['security']['threats']:
+                self.stats['threats'] += 1
+            if record['request']['method'] == 'DELETE':
+                self.stats['deletes'] += 1
             
-            # Flush if buffer full or time elapsed
-            if len(self.buffer) >= Config.BUFFER_SIZE or \
-               time.time() - self.last_flush > Config.FLUSH_INTERVAL:
+            if len(self.buffer) >= Config.BUFFER_SIZE or time.time() - self.last_flush > Config.FLUSH_INTERVAL:
                 self._flush()
     
     def _flush(self):
-        """Write buffer to disk."""
         if not self.buffer:
             return
-        
         try:
             with open(self.log_path, 'a') as f:
-                for record in self.buffer:
-                    f.write(json.dumps(record, ensure_ascii=False) + '\n')
+                for r in self.buffer:
+                    f.write(json.dumps(r, ensure_ascii=False) + '\n')
             self.buffer = []
             self.last_flush = time.time()
         except Exception as e:
-            print(f"[ERROR] Failed to write log: {e}", file=sys.stderr)
+            print(f"[ERROR] Write failed: {e}", file=sys.stderr)
     
     def close(self):
-        """Flush and close."""
         with self.lock:
             self._flush()
 
 
 #===============================================================================
-# DAEMON MODE
+# DAEMON
 #===============================================================================
 
 def daemonize():
-    """Fork into background daemon."""
-    # First fork
     pid = os.fork()
     if pid > 0:
         sys.exit(0)
     
-    # Decouple from parent
     os.chdir('/')
     os.setsid()
     os.umask(0)
     
-    # Second fork
     pid = os.fork()
     if pid > 0:
         sys.exit(0)
     
-    # Redirect stdio
     sys.stdout.flush()
     sys.stderr.flush()
     
@@ -447,7 +568,6 @@ def daemonize():
     os.dup2(log_out.fileno(), sys.stdout.fileno())
     os.dup2(log_out.fileno(), sys.stderr.fileno())
     
-    # Write PID file
     with open(Config.PID_FILE, 'w') as f:
         f.write(str(os.getpid()))
 
@@ -457,83 +577,78 @@ def daemonize():
 #===============================================================================
 
 def main():
-    # Check for daemon mode
     daemon_mode = '--daemon' in sys.argv or '-d' in sys.argv
     
     if daemon_mode:
-        print("[*] Starting in daemon mode...")
+        print("[*] Starting daemon...")
         daemonize()
     else:
         print("=" * 70)
-        print(" FORENSIC BLACK BOX RECORDER - Criminal Investigation Grade")
+        print(" FORENSIC BLACK BOX v3.0 - Enterprise Investigation Grade")
         print("=" * 70)
-        print()
-        print(f" Log File: {Config.LOG_FILE}")
-        print(f" Mode: {'DAEMON (background)' if daemon_mode else 'FOREGROUND'}")
-        print()
-        print(" Modules: IDENTITY | BEHAVIOR | THREAT | EVIDENCE | INTEGRITY")
-        print()
+        print(f" Log: {Config.LOG_FILE}")
+        print(" Capturing: ALL ports | ALL methods | POST/PUT/DELETE bodies")
         print(" Press Ctrl+C to stop")
-        print()
         print("-" * 70)
         print()
     
     processor = PacketProcessor()
     logger = ForensicLogger(Config.LOG_FILE)
     
-    # Shutdown handler
     def shutdown(sig, frame):
         logger.close()
         if os.path.exists(Config.PID_FILE):
             os.remove(Config.PID_FILE)
-        print(f"\n[*] Shutdown. Total: {logger.total} | Threats: {logger.threats}")
+        s = logger.stats
+        print(f"\n[*] Total: {s['total']} | Threats: {s['threats']} | Deletes: {s['deletes']}")
         sys.exit(0)
     
     signal.signal(signal.SIGINT, shutdown)
     signal.signal(signal.SIGTERM, shutdown)
     
-    # Build tcpdump command
-    if Config.WEB_PORTS == "ALL":
-        # Capture ALL TCP traffic
-        cmd = ['tcpdump', '-i', 'any', '-A', '-s', '0', '-l', '-n', 'tcp']
-    else:
-        ports = ' or '.join(f'port {p}' for p in Config.WEB_PORTS)
-        cmd = ['tcpdump', '-i', 'any', '-A', '-s', '0', '-l', '-n', f'tcp and ({ports})']
+    # Build command
+    cmd = ['tcpdump', '-i', 'any', '-A', '-s', '0', '-l', '-n', 'tcp']
     
     try:
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            bufsize=1
-        )
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1)
         
         for line in proc.stdout:
             record = processor.process(line)
             if record:
                 logger.log(record)
                 
-                # Console output (foreground mode only)
                 if not daemon_mode:
                     r = record
-                    risk = r['security']['risk_level']
-                    risk_color = '\033[91m' if risk == 'HIGH' else '\033[92m'
-                    reset = '\033[0m'
+                    m = r['request']['method']
                     
-                    print(f"[{r['timestamp_human']}] {r['request']['method']} {r['request']['uri']}")
-                    print(f"    IP: {r['identity']['ip']} ({r['identity']['country']}) | {r['identity']['browser']}/{r['identity']['device']}")
-                    if r['evidence']['post_data']:
-                        print(f"    DATA: {json.dumps(r['evidence']['post_data'])[:100]}")
-                    if r['security']['threats_detected']:
-                        print(f"    {risk_color}⚠ THREATS: {r['security']['threats_detected']}{reset}")
+                    # Color coding
+                    if m == 'DELETE':
+                        mc = '\033[91m'  # Red
+                    elif m == 'POST':
+                        mc = '\033[93m'  # Yellow
+                    elif m in ['PUT', 'PATCH']:
+                        mc = '\033[95m'  # Magenta
+                    else:
+                        mc = '\033[92m'  # Green
+                    
+                    rst = '\033[0m'
+                    
+                    print(f"[{r['timestamp_display']}] {mc}{m}{rst} {r['request']['uri']}")
+                    print(f"    IP: {r['identity']['ip']} | {r['identity']['browser']}")
+                    
+                    if r['evidence']['resource_id']:
+                        print(f"    Resource ID: {r['evidence']['resource_id']}")
+                    
+                    if r['evidence']['body']:
+                        print(f"    Body: {json.dumps(r['evidence']['body'])[:120]}")
+                    
+                    if r['security']['threats']:
+                        print(f"    \033[91m⚠ THREATS: {r['security']['threats']}{rst}")
+                    
                     print()
     
     except FileNotFoundError:
-        print("[ERROR] tcpdump not found. Install: sudo apt install tcpdump")
-        sys.exit(1)
-    except PermissionError:
-        print("[ERROR] Run as root: sudo python3 production_recorder.py")
+        print("[ERROR] tcpdump not found")
         sys.exit(1)
 
 
