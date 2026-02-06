@@ -1,0 +1,86 @@
+#!/usr/bin/env bpftrace
+/*
+ * HTTPS Traffic Monitor - eBPF/bpftrace
+ * 
+ * Hooks SSL_read/SSL_write to capture decrypted HTTPS traffic.
+ * PRODUCTION SAFE: Read-only observation, no data modification.
+ * 
+ * Usage: sudo bpftrace https_monitor.bt
+ */
+
+BEGIN
+{
+    printf("{\"event\":\"START\",\"ts\":\"%s\",\"msg\":\"HTTPS monitor started\"}\n", strftime("%Y-%m-%d %H:%M:%S IST", nsecs));
+}
+
+/*
+ * Hook: SSL_read return
+ * Captures data RECEIVED from client (incoming requests)
+ * 
+ * int SSL_read(SSL *ssl, void *buf, int num);
+ * - arg0: SSL context
+ * - arg1: buffer with decrypted data
+ * - retval: bytes read
+ */
+uretprobe:/lib/x86_64-linux-gnu/libssl.so.3:SSL_read,
+uretprobe:/lib/x86_64-linux-gnu/libssl.so.1.1:SSL_read,
+uretprobe:/usr/lib/x86_64-linux-gnu/libssl.so.3:SSL_read,
+uretprobe:/usr/lib/x86_64-linux-gnu/libssl.so.1.1:SSL_read
+/retval > 0/
+{
+    $data = str(arg1, retval < 512 ? retval : 512);
+    $ts = strftime("%Y-%m-%d %H:%M:%S IST", nsecs);
+    $pid = pid;
+    $comm = comm;
+    
+    // Check for HTTP request methods
+    if (strcontains($data, "GET ") || 
+        strcontains($data, "POST ") || 
+        strcontains($data, "PUT ") ||
+        strcontains($data, "DELETE ") ||
+        strcontains($data, "PATCH ") ||
+        strcontains($data, "HEAD "))
+    {
+        printf("{\"ts\":\"%s\",\"pid\":%d,\"process\":\"%s\",\"event\":\"REQUEST\",\"data\":\"%s\"}\n",
+               $ts, $pid, $comm, $data);
+    }
+}
+
+/*
+ * Alternative: Hook SSL_read entry to get buffer pointer
+ * Then read on return
+ */
+uprobe:/lib/x86_64-linux-gnu/libssl.so.3:SSL_read,
+uprobe:/lib/x86_64-linux-gnu/libssl.so.1.1:SSL_read,
+uprobe:/usr/lib/x86_64-linux-gnu/libssl.so.3:SSL_read,
+uprobe:/usr/lib/x86_64-linux-gnu/libssl.so.1.1:SSL_read
+{
+    @ssl_buf[tid] = arg1;
+}
+
+uretprobe:/lib/x86_64-linux-gnu/libssl.so.3:SSL_read,
+uretprobe:/lib/x86_64-linux-gnu/libssl.so.1.1:SSL_read,
+uretprobe:/usr/lib/x86_64-linux-gnu/libssl.so.3:SSL_read,
+uretprobe:/usr/lib/x86_64-linux-gnu/libssl.so.1.1:SSL_read
+/retval > 0 && @ssl_buf[tid]/
+{
+    $buf = @ssl_buf[tid];
+    $len = retval < 256 ? retval : 256;
+    $data = str($buf, $len);
+    $ts = strftime("%Y-%m-%d %H:%M:%S IST", nsecs);
+    
+    // Only log HTTP-like content
+    if (strcontains($data, "HTTP") || strcontains($data, "GET") || strcontains($data, "POST"))
+    {
+        printf("{\"ts\":\"%s\",\"pid\":%d,\"comm\":\"%s\",\"bytes\":%d,\"payload\":\"%s\"}\n",
+               $ts, pid, comm, retval, $data);
+    }
+    
+    delete(@ssl_buf[tid]);
+}
+
+END
+{
+    printf("{\"event\":\"STOP\",\"ts\":\"%s\",\"msg\":\"HTTPS monitor stopped\"}\n", strftime("%Y-%m-%d %H:%M:%S IST", nsecs));
+    clear(@ssl_buf);
+}
